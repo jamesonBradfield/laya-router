@@ -135,6 +135,113 @@ async def classify_prompt(prompt: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def prune_messages(
+    messages: list[dict[str, Any]],
+    max_chars: int = 80000,
+    keep_recent_tool_turns: int = 3,
+    min_tail_messages: int = 10,
+) -> tuple[list[dict[str, Any]], bool, int, int]:
+    """Deterministically prune messages to fit within working slot limits without LLM compression.
+
+    Pass 1: Truncates ephemeral tool outputs (>3 turns ago) while preserving OpenAI envelope.
+    Pass 2: Pinned-Head + Sliding-Tail (Donut window) if context still exceeds max_chars.
+    """
+    if not messages:
+        return messages, False, 0, 0
+
+    msgs = [dict(m) for m in messages if isinstance(m, dict)]
+    original_chars = sum(len(str(m.get("content", ""))) for m in msgs)
+
+    # Find all assistant messages that have tool_calls
+    tool_call_turn_indices = []
+    for i, m in enumerate(msgs):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            tool_call_turn_indices.append(i)
+
+    # Pass 1: Ephemeral Tool Output Truncation
+    protected_turn_cutoff = -1
+    if len(tool_call_turn_indices) > keep_recent_tool_turns:
+        protected_turn_cutoff = tool_call_turn_indices[-keep_recent_tool_turns]
+
+    for i, m in enumerate(msgs):
+        if m.get("role") == "tool":
+            if protected_turn_cutoff != -1 and i < protected_turn_cutoff:
+                content = str(m.get("content", ""))
+                if len(content) > 300:
+                    msgs[i] = dict(m)
+                    msgs[i]["content"] = (
+                        f"[Output evicted: {len(content)} chars truncated to preserve working window. "
+                        f"Ground truth preserved in LCM history / on disk.]"
+                    )
+
+    chars_after_tool_pruning = sum(len(str(m.get("content", ""))) for m in msgs)
+    if chars_after_tool_pruning <= max_chars:
+        return msgs, (chars_after_tool_pruning < original_chars), original_chars, chars_after_tool_pruning
+
+    # Pass 2: Pinned Head + Sliding Tail ("Donut" Window)
+    if len(msgs) <= min_tail_messages + 2:
+        return msgs, True, original_chars, chars_after_tool_pruning
+
+    # Determine Head (Option B):
+    # Pin all initial messages (system, user spec, clarifying questions/answers)
+    # up until the first assistant message that executes tool_calls.
+    head_end_idx = 0
+    for idx, m in enumerate(msgs):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            head_end_idx = idx
+            break
+
+    # Fallback if no tool calls exist: pin up through the first user turn
+    if head_end_idx == 0:
+        for idx, m in enumerate(msgs):
+            if m.get("role") == "user":
+                head_end_idx = idx + 1
+                break
+
+    # Safety bounds for head: at least 1 message, at most 8 messages
+    head_end_idx = max(1, min(head_end_idx, 8))
+
+    # Determine Tail: start with last min_tail_messages
+    tail_start_idx = len(msgs) - min_tail_messages
+
+    # Boundary search: never separate a tool response from its parent assistant tool_call
+    while tail_start_idx > head_end_idx:
+        current_msg = msgs[tail_start_idx]
+        prev_msg = msgs[tail_start_idx - 1] if tail_start_idx > 0 else None
+
+        if current_msg.get("role") == "tool":
+            tail_start_idx -= 1
+            continue
+
+        if prev_msg and prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+            tail_start_idx -= 1
+            continue
+
+        break
+
+    if tail_start_idx <= head_end_idx:
+        return msgs, True, original_chars, chars_after_tool_pruning
+
+    omitted_count = tail_start_idx - head_end_idx
+    marker = {
+        "role": "system",
+        "content": (
+            f"[System Note: {omitted_count} intermediate tool turns omitted to preserve working context. "
+            f"All earlier file operations, tests, and edits completed and reside on disk. "
+            f"Complete transcript is preserved losslessly in LCM history. "
+            f"Proceed with current task execution based on the latest working state above — "
+            f"do not repeat completed searches or re-read unchanged files unless required.]"
+        ),
+    }
+
+    head = msgs[:head_end_idx]
+    tail = msgs[tail_start_idx:]
+    pruned_msgs = head + [marker] + tail
+    final_chars = sum(len(str(m.get("content", ""))) for m in pruned_msgs)
+
+    return pruned_msgs, True, original_chars, final_chars
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     assert client is not None
@@ -147,6 +254,21 @@ async def chat_completions(request: Request):
     messages = body.get("messages", [])
     stream = bool(body.get("stream", False))
     has_tools = bool(body.get("tools"))
+
+    # Deterministic context window pruning: zero LLM inference cost, prevents 32k slot overflow
+    pruned_messages, was_pruned, orig_chars, final_chars = prune_messages(
+        messages,
+        max_chars=80000,
+        keep_recent_tool_turns=3,
+        min_tail_messages=10,
+    )
+    if was_pruned:
+        logger.info(
+            f"Pruned working context: {orig_chars} -> {final_chars} chars "
+            f"({len(messages)} -> {len(pruned_messages)} msgs)"
+        )
+        messages = pruned_messages
+        body["messages"] = pruned_messages
 
     # Compute context characters
     total_chars = sum(len(str(m.get("content", ""))) for m in messages if isinstance(m, dict))
