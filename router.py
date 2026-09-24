@@ -135,76 +135,165 @@ async def classify_prompt(prompt: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+IDEMPOTENT_TOOLS = {"read_file", "search_files", "lcm_grep", "lcm_describe"}
+
+
+def normalize_tool_args(raw_args: str) -> str:
+    try:
+        data = json.loads(raw_args)
+        if isinstance(data, dict):
+            return json.dumps(data, sort_keys=True)
+    except Exception:
+        pass
+    return raw_args.strip()
+
+
+def extract_error_summary(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "Unknown error"
+    for line in reversed(lines):
+        for err_prefix in ("Error:", "Exception:", "SyntaxError:", "ValueError:", "TypeError:", "FileNotFoundError:"):
+            if err_prefix in line:
+                return line[:100]
+    return lines[0][:100]
+
+
+def is_error_content(text: str) -> bool:
+    if "Traceback (most recent call last):" in text:
+        return True
+    if any(k in text for k in ("SyntaxError:", "FileNotFoundError:", "ImportError:", "ModuleNotFoundError:")):
+        return True
+    if '"exit_code": 1' in text or '"exit_code": 2' in text or '"exit_code": 127' in text:
+        return True
+    if text.strip().startswith("Error:") or text.strip().startswith("error:"):
+        return True
+    return False
+
+
 def prune_messages(
     messages: list[dict[str, Any]],
     max_chars: int = 80000,
     keep_recent_tool_turns: int = 3,
     min_tail_messages: int = 10,
-) -> tuple[list[dict[str, Any]], bool, int, int]:
-    """Deterministically prune messages to fit within working slot limits without LLM compression.
+) -> tuple[list[dict[str, Any]], bool, int, int, dict[str, Any]]:
+    """Deterministically prune messages using DCP strategies + Donut windowing.
 
-    Pass 1: Truncates ephemeral tool outputs (>3 turns ago) while preserving OpenAI envelope.
-    Pass 2: Pinned-Head + Sliding-Tail (Donut window) if context still exceeds max_chars.
+    Pass 1: Deduplicate redundant idempotent tool reads (read_file, search_files).
+    Pass 2: Tombstone resolved error tracebacks older than keep_recent_tool_turns.
+    Pass 3: Truncate ephemeral tool outputs (>3 turns ago) while preserving OpenAI envelope.
+    Pass 4: Pinned-Head (Option B) + Sliding-Tail if context still exceeds max_chars.
     """
+    stats = {
+        "dedupes": 0,
+        "errors_purged": 0,
+        "evicted_tools": 0,
+        "donut_omitted": 0,
+        "reclaimed_chars": 0,
+    }
     if not messages:
-        return messages, False, 0, 0
+        return messages, False, 0, 0, stats
 
     msgs = [dict(m) for m in messages if isinstance(m, dict)]
     original_chars = sum(len(str(m.get("content", ""))) for m in msgs)
 
-    # Find all assistant messages that have tool_calls
+    # Index assistant tool calls
     tool_call_turn_indices = []
+    tool_calls_by_id = {}
     for i, m in enumerate(msgs):
         if m.get("role") == "assistant" and m.get("tool_calls"):
             tool_call_turn_indices.append(i)
+            for tc in m.get("tool_calls", []):
+                tc_id = tc.get("id")
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                args = normalize_tool_args(fn.get("arguments", ""))
+                tool_calls_by_id[tc_id] = (i, name, args)
 
-    # Pass 1: Ephemeral Tool Output Truncation
+    # Protected recent cutoff (last keep_recent_tool_turns)
     protected_turn_cutoff = -1
     if len(tool_call_turn_indices) > keep_recent_tool_turns:
         protected_turn_cutoff = tool_call_turn_indices[-keep_recent_tool_turns]
 
+    # PASS 1: DCP Redundant Tool Deduplication
+    latest_idempotent_call = {}
+    for tc_id, (turn_idx, name, args) in tool_calls_by_id.items():
+        if name in IDEMPOTENT_TOOLS:
+            key = (name, args)
+            if key not in latest_idempotent_call or turn_idx > latest_idempotent_call[key][0]:
+                latest_idempotent_call[key] = (turn_idx, tc_id)
+
+    pruned_tool_call_ids = set()
     for i, m in enumerate(msgs):
         if m.get("role") == "tool":
+            tc_id = m.get("tool_call_id")
+            if tc_id in tool_calls_by_id:
+                turn_idx, name, args = tool_calls_by_id[tc_id]
+                key = (name, args)
+                if name in IDEMPOTENT_TOOLS and latest_idempotent_call.get(key)[1] != tc_id:
+                    content = str(m.get("content", ""))
+                    if len(content) > 200:
+                        latest_turn = latest_idempotent_call[key][0]
+                        stub = f"[Duplicate {name} pruned: {len(content)} chars. Superseded by newer call at turn {latest_turn}.]"
+                        msgs[i] = dict(m)
+                        msgs[i]["content"] = stub
+                        pruned_tool_call_ids.add(tc_id)
+                        stats["dedupes"] += 1
+                        stats["reclaimed_chars"] += (len(content) - len(stub))
+
+    # PASS 2 & 3: Resolved Error Tombstoning and Ephemeral Tool Truncation
+    for i, m in enumerate(msgs):
+        if m.get("role") == "tool":
+            tc_id = m.get("tool_call_id")
+            if tc_id in pruned_tool_call_ids:
+                continue
+
             if protected_turn_cutoff != -1 and i < protected_turn_cutoff:
                 content = str(m.get("content", ""))
                 if len(content) > 300:
                     msgs[i] = dict(m)
-                    msgs[i]["content"] = (
-                        f"[Output evicted: {len(content)} chars truncated to preserve working window. "
-                        f"Ground truth preserved in LCM history / on disk.]"
-                    )
+                    if is_error_content(content):
+                        err_summary = extract_error_summary(content)
+                        stub = (
+                            f"[Historical error output pruned: {len(content)} chars. "
+                            f"Summary: {err_summary}. Resolved in subsequent turns.]"
+                        )
+                        msgs[i]["content"] = stub
+                        stats["errors_purged"] += 1
+                        stats["reclaimed_chars"] += (len(content) - len(stub))
+                    else:
+                        stub = (
+                            f"[Output evicted: {len(content)} chars truncated to preserve working window. "
+                            f"Ground truth preserved in LCM history / on disk.]"
+                        )
+                        msgs[i]["content"] = stub
+                        stats["evicted_tools"] += 1
+                        stats["reclaimed_chars"] += (len(content) - len(stub))
 
     chars_after_tool_pruning = sum(len(str(m.get("content", ""))) for m in msgs)
     if chars_after_tool_pruning <= max_chars:
-        return msgs, (chars_after_tool_pruning < original_chars), original_chars, chars_after_tool_pruning
+        was_pruned = chars_after_tool_pruning < original_chars
+        return msgs, was_pruned, original_chars, chars_after_tool_pruning, stats
 
-    # Pass 2: Pinned Head + Sliding Tail ("Donut" Window)
+    # PASS 4: Pinned Head (Option B) + Sliding Tail ("Donut" Window)
     if len(msgs) <= min_tail_messages + 2:
-        return msgs, True, original_chars, chars_after_tool_pruning
+        return msgs, True, original_chars, chars_after_tool_pruning, stats
 
-    # Determine Head (Option B):
-    # Pin all initial messages (system, user spec, clarifying questions/answers)
-    # up until the first assistant message that executes tool_calls.
     head_end_idx = 0
     for idx, m in enumerate(msgs):
         if m.get("role") == "assistant" and m.get("tool_calls"):
             head_end_idx = idx
             break
 
-    # Fallback if no tool calls exist: pin up through the first user turn
     if head_end_idx == 0:
         for idx, m in enumerate(msgs):
             if m.get("role") == "user":
                 head_end_idx = idx + 1
                 break
 
-    # Safety bounds for head: at least 1 message, at most 8 messages
     head_end_idx = max(1, min(head_end_idx, 8))
-
-    # Determine Tail: start with last min_tail_messages
     tail_start_idx = len(msgs) - min_tail_messages
 
-    # Boundary search: never separate a tool response from its parent assistant tool_call
     while tail_start_idx > head_end_idx:
         current_msg = msgs[tail_start_idx]
         prev_msg = msgs[tail_start_idx - 1] if tail_start_idx > 0 else None
@@ -220,7 +309,7 @@ def prune_messages(
         break
 
     if tail_start_idx <= head_end_idx:
-        return msgs, True, original_chars, chars_after_tool_pruning
+        return msgs, True, original_chars, chars_after_tool_pruning, stats
 
     omitted_count = tail_start_idx - head_end_idx
     marker = {
@@ -238,8 +327,10 @@ def prune_messages(
     tail = msgs[tail_start_idx:]
     pruned_msgs = head + [marker] + tail
     final_chars = sum(len(str(m.get("content", ""))) for m in pruned_msgs)
+    stats["donut_omitted"] = omitted_count
+    stats["reclaimed_chars"] = original_chars - final_chars
 
-    return pruned_msgs, True, original_chars, final_chars
+    return pruned_msgs, True, original_chars, final_chars, stats
 
 
 @app.post("/v1/chat/completions")
@@ -256,7 +347,7 @@ async def chat_completions(request: Request):
     has_tools = bool(body.get("tools"))
 
     # Deterministic context window pruning: zero LLM inference cost, prevents 32k slot overflow
-    pruned_messages, was_pruned, orig_chars, final_chars = prune_messages(
+    pruned_messages, was_pruned, orig_chars, final_chars, stats = prune_messages(
         messages,
         max_chars=80000,
         keep_recent_tool_turns=3,
@@ -264,8 +355,10 @@ async def chat_completions(request: Request):
     )
     if was_pruned:
         logger.info(
-            f"Pruned working context: {orig_chars} -> {final_chars} chars "
-            f"({len(messages)} -> {len(pruned_messages)} msgs)"
+            f"[DCP] Pruned: {orig_chars} -> {final_chars} chars "
+            f"({len(messages)} -> {len(pruned_messages)} msgs) | "
+            f"Dedupes: {stats['dedupes']}, Errors: {stats['errors_purged']}, "
+            f"Evicted: {stats['evicted_tools']}, Donut: {stats['donut_omitted']}"
         )
         messages = pruned_messages
         body["messages"] = pruned_messages
@@ -392,6 +485,9 @@ async def chat_completions(request: Request):
     resp_headers = {
         "X-Router-Tier": active_tag,
         "X-Router-Model": active_model or "default",
+        "X-DCP-Dedupes": str(stats.get("dedupes", 0)),
+        "X-DCP-Errors-Purged": str(stats.get("errors_purged", 0)),
+        "X-DCP-Reclaimed-Chars": str(stats.get("reclaimed_chars", 0)),
     }
 
     if stream:
