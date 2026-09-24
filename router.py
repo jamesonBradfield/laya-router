@@ -218,46 +218,65 @@ async def chat_completions(request: Request):
             target_model = model_requested
             tier_tag = "llama-swap-explicit"
 
-    # Mutate model in body if resolved
-    forward_body = dict(body)
-    if target_model:
-        forward_body["model"] = target_model
-    elif "model" in forward_body and target_upstream == UPSTREAM_KEYPOOL:
-        # Keypool can pick default based on capabilities if model is omitted
-        del forward_body["model"]
+    # Cascading dispatch helper
+    async def try_dispatch(upstream: str, model: str, tag: str):
+        body_to_send = dict(body)
+        h = {"Content-Type": "application/json"}
+        h.update(extra_headers)
+        if model:
+            body_to_send["model"] = model
+        elif "model" in body_to_send and upstream == UPSTREAM_KEYPOOL:
+            del body_to_send["model"]
+            
+        url = f"{upstream}/v1/chat/completions"
+        logger.info(f"Dispatching to {tag} -> {url} (model={model or 'default'})")
+        
+        if stream:
+            req = client.build_request("POST", url, json=body_to_send, headers=h)
+            res = await client.send(req, stream=True)
+            return res, tag, model
+        else:
+            res = await client.post(url, json=body_to_send, headers=h)
+            return res, tag, model
 
-    forward_url = f"{target_upstream}/v1/chat/completions"
-    logger.info(f"Dispatching to {tier_tag} -> {forward_url} (model={target_model or 'default'})")
+    res, active_tag, active_model = await try_dispatch(target_upstream, target_model, tier_tag)
 
-    headers = {"Content-Type": "application/json"}
-    headers.update(extra_headers)
+    # Automatic cascade if Tier 1 is busy (concurrency limit reached on V320)
+    if res.status_code == 429 and active_tag == "tier1-v320":
+        logger.warning("Tier 1 (V320) busy (429 concurrency limit). Cascading to Tier 2 (7700XT)...")
+        if stream:
+            await res.aclose()
+        res, active_tag, active_model = await try_dispatch(UPSTREAM_LLAMA_SWAP, TIER2_7700XT, "tier2-7700xt-fallback")
+
+    # Automatic cascade to Cloud Frontier if local GPU tiers are busy
+    if res.status_code == 429 and ("tier2" in active_tag):
+        logger.warning(f"{active_tag} busy (429). Cascading to Cloud Frontier...")
+        if stream:
+            await res.aclose()
+        extra_headers["X-Keypool-Capabilities"] = "agentic" if has_tools else "general_purpose"
+        res, active_tag, active_model = await try_dispatch(UPSTREAM_KEYPOOL, "", "cloud-frontier-fallback")
+
+    resp_headers = {
+        "X-Router-Tier": active_tag,
+        "X-Router-Model": active_model or "default",
+    }
 
     if stream:
-        req = client.build_request("POST", forward_url, json=forward_body, headers=headers)
-        r = await client.send(req, stream=True)
-
-        if r.status_code != 200:
-            content = await r.aread()
-            return Response(content=content, status_code=r.status_code, media_type="application/json")
+        if res.status_code != 200:
+            content = await res.aread()
+            return Response(content=content, status_code=res.status_code, media_type="application/json", headers=resp_headers)
 
         async def stream_generator():
-            async for chunk in r.aiter_bytes():
+            async for chunk in res.aiter_bytes():
                 yield chunk
 
-        resp_headers = {
+        resp_headers.update({
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "X-Router-Tier": tier_tag,
-            "X-Router-Model": target_model or "default",
-        }
+        })
         return StreamingResponse(stream_generator(), headers=resp_headers)
     else:
-        r = await client.post(forward_url, json=forward_body, headers=headers)
-        resp_headers = {
-            "X-Router-Tier": tier_tag,
-            "X-Router-Model": target_model or "default",
-        }
-        return Response(content=r.content, status_code=r.status_code, media_type="application/json", headers=resp_headers)
+        return Response(content=res.content, status_code=res.status_code, media_type="application/json", headers=resp_headers)
 
 
 if __name__ == "__main__":
