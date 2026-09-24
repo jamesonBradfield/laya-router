@@ -256,6 +256,17 @@ async def chat_completions(request: Request):
         extra_headers["X-Keypool-Capabilities"] = "agentic" if has_tools else "general_purpose"
         res, active_tag, active_model = await try_dispatch(UPSTREAM_KEYPOOL, "", "cloud-frontier-fallback")
 
+    # Automatic cascade if Cloud is rate-limited (429), fall back to local GPU
+    if res.status_code == 429 and active_tag.startswith("cloud-"):
+        logger.warning(f"{active_tag} rate limited (429). Falling back to local GPU Tier 1/2...")
+        if stream:
+            await res.aclose()
+        res, active_tag, active_model = await try_dispatch(UPSTREAM_LLAMA_SWAP, TIER1_V320, "local-fallback-v320")
+        if res.status_code == 429:
+            if stream:
+                await res.aclose()
+            res, active_tag, active_model = await try_dispatch(UPSTREAM_LLAMA_SWAP, TIER2_7700XT, "local-fallback-7700xt")
+
     resp_headers = {
         "X-Router-Tier": active_tag,
         "X-Router-Model": active_model or "default",

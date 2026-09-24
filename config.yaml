@@ -10,7 +10,7 @@ upstreams:
 defaults:
   tier1_v320_model: Tiel-Coder-35B-A3B-MTP-IQ3_XXS
   tier2_7700xt_model: Ternary-Bonsai-2-27B-7700XT
-  large_context_chars: 24000  # ~6k tokens -> route to large_context cloud
+  large_context_chars: 180000  # ~45k tokens (local models have 65k context)
 
 thresholds:
   complex_coding_noul: 0.50
