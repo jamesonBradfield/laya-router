@@ -1,0 +1,13 @@
+[Unit]
+Description=Laya Typed Decisions HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jamesontb/laya
+ExecStart=/home/jamesontb/laya/build-vulkan/bin/laya-cli --model /home/jamesontb/laya/models/laya --cpu --server --port 8081
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

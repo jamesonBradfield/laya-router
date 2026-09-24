@@ -1,0 +1,17 @@
+server:
+  host: 127.0.0.1
+  port: 8090
+
+upstreams:
+  laya: http://127.0.0.1:8081
+  llama_swap: http://127.0.0.1:8080
+  keypool: http://127.0.0.1:8005
+
+defaults:
+  tier1_v320_model: Tiel-Coder-35B-A3B-MTP-IQ3_XXS
+  tier2_7700xt_model: Ternary-Bonsai-2-27B-7700XT
+  large_context_chars: 24000  # ~6k tokens -> route to large_context cloud
+
+thresholds:
+  complex_coding_noul: 0.50
+  frontier_cloud_noul: 0.65

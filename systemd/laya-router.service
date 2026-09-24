@@ -1,0 +1,13 @@
+[Unit]
+Description=Laya Decision Router Service
+After=network.target laya.service llm-keypool.service llama-swap.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jamesontb/laya-router
+ExecStart=/home/jamesontb/laya-router/.venv/bin/python /home/jamesontb/laya-router/router.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

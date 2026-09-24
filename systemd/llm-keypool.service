@@ -1,0 +1,13 @@
+[Unit]
+Description=LLM Keypool Free Tier Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jamesontb
+ExecStart=/home/jamesontb/.local/share/uv/tools/llm-keypool/bin/llm-keypool proxy --port 8005
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
