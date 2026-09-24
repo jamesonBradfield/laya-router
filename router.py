@@ -123,7 +123,7 @@ async def classify_prompt(prompt: str) -> tuple[float, float]:
         }
     }
     try:
-        r = await client.post(f"{UPSTREAM_LAYA}/v1/systemone", json=payload, timeout=2.0)
+        r = await client.post(f"{UPSTREAM_LAYA}/v1/systemone", json=payload, timeout=6.0)
         if r.status_code == 200:
             data = r.json()
             answers = data.get("answers", {})
@@ -131,7 +131,7 @@ async def classify_prompt(prompt: str) -> tuple[float, float]:
             cloud_score = float(answers.get("cloud", {}).get("noul", 0.0))
             return coding_score, cloud_score
     except Exception as e:
-        logger.warning(f"Laya classification failed: {e}")
+        logger.warning(f"Laya classification failed: {type(e).__name__}: {repr(e)}")
     return 0.0, 0.0
 
 

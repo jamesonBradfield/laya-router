@@ -1,6 +1,6 @@
 [Unit]
 Description=Laya Decision Router Service
-After=network.target laya.service llm-keypool.service llama-swap.service
+After=network.target llm-keypool.service llama-swap.service
 
 [Service]
 Type=simple
