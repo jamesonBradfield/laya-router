@@ -9,6 +9,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from vram_calculator import calculate_fit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("laya-router")
@@ -23,7 +24,7 @@ PORT = config.get("server", {}).get("port", 8090)
 UPSTREAM_LAYA = config.get("upstreams", {}).get("laya", "http://127.0.0.1:8081")
 UPSTREAM_LLAMA_SWAP = config.get("upstreams", {}).get("llama_swap", "http://127.0.0.1:8080")
 UPSTREAM_KEYPOOL = config.get("upstreams", {}).get("keypool", "http://127.0.0.1:8005")
-
+TEIR1_SEMAPHORE = asyncio.Semaphore(2)
 TIER1_V320 = config.get("defaults", {}).get("tier1_v320_model", "Tiel-Coder-35B-A3B-MTP-IQ3_XXS")
 TIER2_7700XT = config.get("defaults", {}).get("tier2_7700xt_model", "Ternary-Bonsai-2-27B-7700XT")
 LARGE_CONTEXT_CHARS = config.get("defaults", {}).get("large_context_chars", 24000)
@@ -394,33 +395,24 @@ async def chat_completions(request: Request):
                 last_prompt = str(m.get("content", ""))
                 break
 
-        # Check large context first
-        if total_chars > LARGE_CONTEXT_CHARS:
-            logger.info(f"Routing to Keypool (large context: {total_chars} chars)")
-            target_upstream = UPSTREAM_KEYPOOL
-            target_model = ""  # Let keypool select default large_context provider (Google)
-            tier_tag = "cloud-large-context"
-            extra_headers["X-Keypool-Capabilities"] = "large_context"
-        else:
-            coding_score, cloud_score = await classify_prompt(last_prompt)
-            logger.info(f"Laya scores: coding={coding_score:.3f}, cloud={cloud_score:.3f}")
+        coding_score, cloud_score = await classify_prompt(last_prompt)
+        logger.info(f"Laya scores: coding={coding_score:.3f}, cloud={cloud_score:.3f}")
 
-            if cloud_score >= CLOUD_THRESHOLD:
-                target_upstream = UPSTREAM_KEYPOOL
-                target_model = ""
-                tier_tag = "cloud-frontier"
-                caps = "agentic" if has_tools else "general_purpose"
-                extra_headers["X-Keypool-Capabilities"] = caps
-            elif coding_score >= CODING_THRESHOLD:
-                target_upstream = UPSTREAM_LLAMA_SWAP
-                target_model = TIER2_7700XT
-                tier_tag = "tier2-7700xt"
-            else:
-                target_upstream = UPSTREAM_LLAMA_SWAP
-                target_model = TIER1_V320
-                tier_tag = "tier1-v320"
+        if cloud_score >= CLOUD_THRESHOLD:
+            target_upstream = UPSTREAM_KEYPOOL
+            target_model = ""
+            tier_tag = "cloud-frontier"
+            caps = "agentic" if has_tools else "general_purpose"
+            extra_headers["X-Keypool-Capabilities"] = caps
+        elif coding_score >= CODING_THRESHOLD:
+            target_upstream = UPSTREAM_LLAMA_SWAP
+            target_model = TIER2_7700XT
+            tier_tag = "tier2-7700xt"
+        else:
+            target_upstream = UPSTREAM_LLAMA_SWAP
+            target_model = TIER1_V320
+            tier_tag = "tier1-v320"
     else:
-        # Check if requested model belongs to cloud providers
         cloud_prefixes = ["google/", "groq/", "mistral/", "cerebras/", "openrouter/", "cloudflare/"]
         if any(model_requested.lower().startswith(p) for p in cloud_prefixes):
             target_upstream = UPSTREAM_KEYPOOL
@@ -433,7 +425,23 @@ async def chat_completions(request: Request):
             target_model = model_requested
             tier_tag = "llama-swap-explicit"
 
-    # Cascading dispatch helper
+# Deterministic VRAM Fit & Contention Guard
+    can_fit, card_or_reason, metrics = calculate_fit(target_model, 65536, 2 if "35B" in target_model else 1)
+    if not can_fit:
+        logger.warning(f"[VRAM Calculator] REJECTED: {card_or_reason}. Sending back / cascading to 7700XT...")
+        target_upstream = UPSTREAM_LLAMA_SWAP
+        target_model = TIER2_7700XT
+        tier_tag = "vram-overflow-fallback-7700xt"
+
+    # --- NEW CONCURRENCY GUARD ---
+    if "tier1" in tier_tag and TIER1_SEMAPHORE.locked():
+        logger.warning("Tier 1 (V320) parallel slots full. Proactively cascading to Tier 2 (7700XT)...")
+        target_upstream = UPSTREAM_LLAMA_SWAP
+        target_model = TIER2_7700XT
+        tier_tag = "tier2-7700xt-fallback"
+    # -----------------------------
+
+# Cascading dispatch helper
     async def try_dispatch(upstream: str, model: str, tag: str):
         body_to_send = dict(body)
         h = {"Content-Type": "application/json"}
@@ -442,16 +450,25 @@ async def chat_completions(request: Request):
             body_to_send["model"] = model
         elif "model" in body_to_send and upstream == UPSTREAM_KEYPOOL:
             del body_to_send["model"]
-            
+
         url = f"{upstream}/v1/chat/completions"
         logger.info(f"Dispatching to {tag} -> {url} (model={model or 'default'})")
-        
-        if stream:
-            req = client.build_request("POST", url, json=body_to_send, headers=h)
-            res = await client.send(req, stream=True)
-            return res, tag, model
+
+        # Local execution function
+        async def _execute():
+            if stream:
+                req = client.build_request("POST", url, json=body_to_send, headers=h)
+                return await client.send(req, stream=True)
+            else:
+                return await client.post(url, json=body_to_send, headers=h)
+
+        # Acquire semaphore only if hitting Tier 1
+        if "tier1" in tag:
+            async with TIER1_SEMAPHORE:
+                res = await _execute()
+                return res, tag, model
         else:
-            res = await client.post(url, json=body_to_send, headers=h)
+            res = await _execute()
             return res, tag, model
 
     res, active_tag, active_model = await try_dispatch(target_upstream, target_model, tier_tag)
