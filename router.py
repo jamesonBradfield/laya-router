@@ -9,6 +9,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from vram_calculator import calculate_fit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("laya-router")
@@ -23,13 +24,34 @@ PORT = config.get("server", {}).get("port", 8090)
 UPSTREAM_LAYA = config.get("upstreams", {}).get("laya", "http://127.0.0.1:8081")
 UPSTREAM_LLAMA_SWAP = config.get("upstreams", {}).get("llama_swap", "http://127.0.0.1:8080")
 UPSTREAM_KEYPOOL = config.get("upstreams", {}).get("keypool", "http://127.0.0.1:8005")
-
-TIER1_V320 = config.get("defaults", {}).get("tier1_v320_model", "Tiel-Coder-35B-A3B-MTP-IQ3_XXS")
-TIER2_7700XT = config.get("defaults", {}).get("tier2_7700xt_model", "Ternary-Bonsai-2-27B-7700XT")
+TIER1_SEMAPHORE = asyncio.Semaphore(2)  # was misspelled TEIR1_SEMAPHORE: every tier-1 request raised NameError
+TIER1_V320 = config.get("defaults", {}).get("tier1_v320_model", "Ternary-Bonsai-2-27B-PQ2_0")  # Tiel tier removed 2026-09-24
+TIER2_7700XT = config.get("defaults", {}).get("tier2_7700xt_model", "Swift-Bonsai-2-7700XT")
 LARGE_CONTEXT_CHARS = config.get("defaults", {}).get("large_context_chars", 24000)
 
 CODING_THRESHOLD = config.get("thresholds", {}).get("complex_coding_noul", 0.50)
 CLOUD_THRESHOLD = config.get("thresholds", {}).get("frontier_cloud_noul", 0.65)
+
+
+def _prune_max_chars() -> int:
+    """The pruner's message budget, derived rather than hardcoded.
+
+    The pruner only sees `messages`; the static floor (system prompt + tool schemas + skills +
+    memory) sits outside it and is charged against the same lane. A round 80000 meant messages of
+    80000 chars plus a ~74k-char floor could exceed a 32k-token lane -- the 2026-09-25 overflow,
+    where the request died with `exceeds the available context size` instead of compacting.
+
+    Assumes ~3 chars/token, NOT 4. The first derivation used 4 and a worker still overflowed at
+    11:21 on 2026-09-25, ~15 min after the declaration fix: code-heavy context runs closer to 3
+    chars/token, which put the same 51,072 chars at ~17k tokens and the composed total over the lane.
+    The conservative ratio costs a little message budget and removes the failure mode.
+    Floored at 8192 so a misconfigured pair can never drive the budget to zero. dfl/audit-declarations.py
+    CI-4 re-derives this from the MEASURED floor and the lane's real --ctx-size.
+    """
+    d = config.get("defaults", {})
+    lane = int(d.get("lane_ctx_tokens", 32768))
+    reserve = int(d.get("reserve_floor_tokens", 20000))
+    return max(8192, (lane - reserve) * 3)
 
 app = FastAPI(title="Laya Smart LLM Router", version="1.0.0")
 client: Optional[httpx.AsyncClient] = None
@@ -171,6 +193,69 @@ def is_error_content(text: str) -> bool:
     return False
 
 
+def _truncate_middle(text: str, limit: int) -> str:
+    """Keep the head and tail of `text`, drop the middle, with an explicit marker.
+
+    Truncating a message's content in place cannot break the chat envelope: no message is
+    added or removed and no field other than `content` is touched, so role sequencing and
+    tool_call/tool_result pairing both survive. That is the property Pass 4 lacks, which is
+    why Pass 4 needs a large enough message count to work with at all.
+    """
+    if len(text) <= limit:
+        return text
+    marker = f"\n\n[... {len(text)} chars; middle omitted by the laya pruner to fit the "
+    marker += "target lane. Head and tail retained verbatim. ...]\n\n"
+    room = max(0, limit - len(marker))
+    if room <= 0:
+        return marker[:limit]
+    head = max(1, int(room * 0.65))
+    tail = room - head
+    return text[:head] + marker + (text[len(text) - tail:] if tail else "")
+
+
+def _truncate_oversize(
+    msgs: list[dict[str, Any]], budget: int, stats: dict[str, Any]
+) -> tuple[list[dict[str, Any]], int]:
+    """Shrink the largest message contents until the total fits `budget`.
+
+    Pass 4 can only DROP whole messages, so it gives up when there are few of them
+    (`len(msgs) <= min_tail_messages + 2`). A prompt that is one enormous message -- a pasted
+    log, a large retrieved document, a tool result that Pass 3 could not touch because it sat
+    inside the protected recent window -- then passes through every pass untouched and hits the
+    lane wall. Measured 2026-09-26: "Pruned: 103508 -> 103508 chars (1 -> 1 msgs)" on three
+    consecutive requests, all of which died with `proxy error: EOF` after minutes of retrying.
+
+    `system` is truncated only after every other role has given what it can: its middle holds
+    the agent's tool-use rules, which is the last thing worth losing.
+    """
+    total = sum(len(str(m.get("content", ""))) for m in msgs)
+    floor = 200  # below this a message is a stub already; truncating it buys nothing
+
+    while total > budget:
+        candidates = [i for i in range(len(msgs)) if len(str(msgs[i].get("content", ""))) > floor]
+        if not candidates:
+            break
+        # largest first, but never start on a system message while a normal one can give
+        candidates.sort(
+            key=lambda i: (
+                msgs[i].get("role") == "system",
+                -len(str(msgs[i].get("content", ""))),
+            )
+        )
+        idx = candidates[0]
+        cur = str(msgs[idx].get("content", ""))
+        new_text = _truncate_middle(cur, max(floor, len(cur) - (total - budget)))
+        if len(new_text) >= len(cur):
+            break  # no progress possible; stop rather than spin
+        msgs[idx] = dict(msgs[idx])
+        msgs[idx]["content"] = new_text
+        stats["oversize_truncated"] += 1
+        stats["reclaimed_chars"] += len(cur) - len(new_text)
+        total = sum(len(str(m.get("content", ""))) for m in msgs)
+
+    return msgs, total
+
+
 def prune_messages(
     messages: list[dict[str, Any]],
     max_chars: int = 80000,
@@ -183,12 +268,15 @@ def prune_messages(
     Pass 2: Tombstone resolved error tracebacks older than keep_recent_tool_turns.
     Pass 3: Truncate ephemeral tool outputs (>3 turns ago) while preserving OpenAI envelope.
     Pass 4: Pinned-Head (Option B) + Sliding-Tail if context still exceeds max_chars.
+    Pass 5: Truncate the middle of the largest over-budget messages if Pass 4 could not free
+            enough (few messages, or one very large one). Content-only, so envelope-safe.
     """
     stats = {
         "dedupes": 0,
         "errors_purged": 0,
         "evicted_tools": 0,
         "donut_omitted": 0,
+        "oversize_truncated": 0,
         "reclaimed_chars": 0,
     }
     if not messages:
@@ -277,7 +365,10 @@ def prune_messages(
 
     # PASS 4: Pinned Head (Option B) + Sliding Tail ("Donut" Window)
     if len(msgs) <= min_tail_messages + 2:
-        return msgs, True, original_chars, chars_after_tool_pruning, stats
+        # Too few messages for windowing to drop anything, but the budget is still blown --
+        # almost always one very large message. Truncate content in place instead.
+        msgs, final_chars = _truncate_oversize(msgs, max_chars, stats)
+        return msgs, True, original_chars, final_chars, stats
 
     head_end_idx = 0
     for idx, m in enumerate(msgs):
@@ -292,6 +383,25 @@ def prune_messages(
                 break
 
     head_end_idx = max(1, min(head_end_idx, 8))
+
+    # HEAD must not split a unit either. The tail loop below already walks backwards off a `tool`
+    # or a tool_calls assistant; the head had no equivalent, so a cut that landed just after an
+    # assistant message carrying tool_calls kept the call and omitted its results -- a dangling
+    # tool_call with no answers, which makes the chat template fail and llama-server answer 500.
+    # (Measured 2026-09-25: 298 such 500s in 6 h, appearing only once the derived cap made this pass
+    # fire. The marker inserted at the end made it worse by putting a system message right after the
+    # dangling call.) Advance past the whole unit instead, and never start the omission on a result.
+    while head_end_idx < len(msgs):
+        prev_msg = msgs[head_end_idx - 1] if head_end_idx > 0 else None
+        this_msg = msgs[head_end_idx]
+        if prev_msg and prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+            head_end_idx += 1
+            continue
+        if this_msg.get("role") == "tool":
+            head_end_idx += 1
+            continue
+        break
+
     tail_start_idx = len(msgs) - min_tail_messages
 
     while tail_start_idx > head_end_idx:
@@ -309,23 +419,39 @@ def prune_messages(
         break
 
     if tail_start_idx <= head_end_idx:
-        return msgs, True, original_chars, chars_after_tool_pruning, stats
+        # Windowing collapsed to nothing: the head and tail already overlap, so there is no
+        # whole message left to drop. Fall through to content truncation, otherwise a prompt
+        # with only a few large messages still reaches the lane over budget.
+        msgs, final_chars = _truncate_oversize(msgs, max_chars, stats)
+        return msgs, True, original_chars, final_chars, stats
 
     omitted_count = tail_start_idx - head_end_idx
-    marker = {
-        "role": "system",
-        "content": (
-            f"[System Note: {omitted_count} intermediate tool turns omitted to preserve working context. "
-            f"All earlier file operations, tests, and edits completed and reside on disk. "
-            f"Complete transcript is preserved losslessly in LCM history. "
-            f"Proceed with current task execution based on the latest working state above — "
-            f"do not repeat completed searches or re-read unchanged files unless required.]"
-        ),
-    }
+    note = (
+        f"[{omitted_count} intermediate tool turns omitted to preserve working context. "
+        f"All earlier file operations, tests, and edits completed and reside on disk. "
+        f"Complete transcript is preserved losslessly in LCM history. "
+        f"Proceed with current task execution based on the latest working state above — "
+        f"do not repeat completed searches or re-read unchanged files unless required.]"
+    )
 
     head = msgs[:head_end_idx]
     tail = msgs[tail_start_idx:]
-    pruned_msgs = head + [marker] + tail
+
+    # Append the note to the LAST KEPT message instead of inserting a synthetic `system` turn.
+    # A system message appearing mid-conversation, right after tool results, is precisely what the
+    # agent guidance forbids ("never a synthetic message injected mid-loop") and what a strict chat
+    # template rejects: measured 13:32, "Pruned: 129085 -> 33452 chars (68 -> 14 msgs)" followed by a
+    # 500 in the same second, 33 of them in 10 minutes. Appending to existing content adds no
+    # message, so role sequencing cannot be broken by this pass at all. The note is advisory; the
+    # omission is the actual optimisation, so it is dropped rather than forced if there is no
+    # message to attach it to.
+    if head:
+        last = dict(head[-1])
+        prev = str(last.get("content", "") or "")
+        last["content"] = (prev + "\n\n" + note) if prev else note
+        head = head[:-1] + [last]
+
+    pruned_msgs = head + tail
     final_chars = sum(len(str(m.get("content", ""))) for m in pruned_msgs)
     stats["donut_omitted"] = omitted_count
     stats["reclaimed_chars"] = original_chars - final_chars
@@ -349,7 +475,7 @@ async def chat_completions(request: Request):
     # Deterministic context window pruning: zero LLM inference cost, prevents 32k slot overflow
     pruned_messages, was_pruned, orig_chars, final_chars, stats = prune_messages(
         messages,
-        max_chars=80000,
+        max_chars=_prune_max_chars(),
         keep_recent_tool_turns=3,
         min_tail_messages=10,
     )
@@ -394,33 +520,40 @@ async def chat_completions(request: Request):
                 last_prompt = str(m.get("content", ""))
                 break
 
-        # Check large context first
-        if total_chars > LARGE_CONTEXT_CHARS:
-            logger.info(f"Routing to Keypool (large context: {total_chars} chars)")
-            target_upstream = UPSTREAM_KEYPOOL
-            target_model = ""  # Let keypool select default large_context provider (Google)
-            tier_tag = "cloud-large-context"
-            extra_headers["X-Keypool-Capabilities"] = "large_context"
-        else:
-            coding_score, cloud_score = await classify_prompt(last_prompt)
-            logger.info(f"Laya scores: coding={coding_score:.3f}, cloud={cloud_score:.3f}")
+        coding_score, cloud_score = await classify_prompt(last_prompt)
 
-            if cloud_score >= CLOUD_THRESHOLD:
-                target_upstream = UPSTREAM_KEYPOOL
-                target_model = ""
-                tier_tag = "cloud-frontier"
-                caps = "agentic" if has_tools else "general_purpose"
-                extra_headers["X-Keypool-Capabilities"] = caps
-            elif coding_score >= CODING_THRESHOLD:
-                target_upstream = UPSTREAM_LLAMA_SWAP
-                target_model = TIER2_7700XT
-                tier_tag = "tier2-7700xt"
-            else:
-                target_upstream = UPSTREAM_LLAMA_SWAP
-                target_model = TIER1_V320
-                tier_tag = "tier1-v320"
+        # Lane selection is by CONTEXT SIZE, not task type. Both local lanes serve the SAME
+        # ternary model, so the only differences are the card and its ctx: the 7700XT entry is
+        # 65536 (and would 400 above that), the V320 entry is 262144. Measured on this box for
+        # identical weights and KV type: 7700XT = 515 pp / 35.6 tg, V320 = 77 pp / 15.6 tg.
+        # So anything that fits 65k belongs on the 7700XT, even though it was the "coding lane".
+        # The coding score is still computed and logged, but no longer picks the lane.
+        _chars = sum(len(str(m.get("content") or "")) for m in messages if isinstance(m, dict))
+        if body.get("tools"):
+            _chars += len(json.dumps(body.get("tools")))
+        est_tokens = _chars // 4
+        logger.info(
+            f"Laya scores: coding={coding_score:.3f}, cloud={cloud_score:.3f} | "
+            f"est_tokens={est_tokens} (large-context threshold {LARGE_CONTEXT_CHARS // 4})"
+        )
+
+        if cloud_score >= CLOUD_THRESHOLD:
+            target_upstream = UPSTREAM_KEYPOOL
+            target_model = ""
+            tier_tag = "cloud-frontier"
+            caps = "agentic" if has_tools else "general_purpose"
+            extra_headers["X-Keypool-Capabilities"] = caps
+        elif est_tokens > LARGE_CONTEXT_CHARS // 4:
+            # LARGE_CONTEXT_CHARS is now actually wired: only the 262k lane has the room, and
+            # the 65536 entry would reject this prompt outright.
+            target_upstream = UPSTREAM_LLAMA_SWAP
+            target_model = TIER1_V320
+            tier_tag = "tier1-v320"
+        else:
+            target_upstream = UPSTREAM_LLAMA_SWAP
+            target_model = TIER2_7700XT
+            tier_tag = "tier2-7700xt"
     else:
-        # Check if requested model belongs to cloud providers
         cloud_prefixes = ["google/", "groq/", "mistral/", "cerebras/", "openrouter/", "cloudflare/"]
         if any(model_requested.lower().startswith(p) for p in cloud_prefixes):
             target_upstream = UPSTREAM_KEYPOOL
@@ -433,7 +566,36 @@ async def chat_completions(request: Request):
             target_model = model_requested
             tier_tag = "llama-swap-explicit"
 
-    # Cascading dispatch helper
+# Deterministic VRAM Fit & Contention Guard
+    # Available VRAM is read live from sysfs inside calculate_fit, so this reflects what the
+    # card has FREE right now -- including models a concurrent worker already made resident.
+    can_fit, card_or_reason, metrics = calculate_fit(
+        target_model, 65536, 2 if "35B" in target_model else 1)
+    if not can_fit:
+        # Overflow must cascade to the lane with the LARGER, headless budget -- the V320.
+        # It must never fall back to the 7700 XT: that card drives both monitors, and a load
+        # that leaves it under ~1 GiB free breaks the compositor's atomic page-flips
+        # (`Cannot allocate memory`) and crash-loops Hyprland into --safe-mode. The old
+        # fallback sent overflow HERE, i.e. a guard that failed open onto the fragile lane.
+        logger.warning(f"[VRAM Calculator] REJECTED: {card_or_reason} "
+                       f"(measured={metrics.get('measured')} "
+                       f"live_free={metrics.get('live_free_mb')}MB) "
+                       f"Cascading to V320 headless lane...")
+        target_upstream = UPSTREAM_LLAMA_SWAP
+        target_model = TIER1_V320
+        tier_tag = "tier1-vram-overflow-fallback-v320"
+
+    # --- NEW CONCURRENCY GUARD ---
+    # Keyed on the tag substring "tier1", so the overflow tag MUST contain it -- otherwise
+    # overflow traffic (which now also targets the V320) would bypass the V320 semaphore.
+    if "tier1" in tier_tag and TIER1_SEMAPHORE.locked():
+        logger.warning("Tier 1 (V320) parallel slots full. Proactively cascading to Tier 2 (7700XT)...")
+        target_upstream = UPSTREAM_LLAMA_SWAP
+        target_model = TIER2_7700XT
+        tier_tag = "tier2-7700xt-fallback"
+    # -----------------------------
+
+# Cascading dispatch helper
     async def try_dispatch(upstream: str, model: str, tag: str):
         body_to_send = dict(body)
         h = {"Content-Type": "application/json"}
@@ -442,16 +604,25 @@ async def chat_completions(request: Request):
             body_to_send["model"] = model
         elif "model" in body_to_send and upstream == UPSTREAM_KEYPOOL:
             del body_to_send["model"]
-            
+
         url = f"{upstream}/v1/chat/completions"
         logger.info(f"Dispatching to {tag} -> {url} (model={model or 'default'})")
-        
-        if stream:
-            req = client.build_request("POST", url, json=body_to_send, headers=h)
-            res = await client.send(req, stream=True)
-            return res, tag, model
+
+        # Local execution function
+        async def _execute():
+            if stream:
+                req = client.build_request("POST", url, json=body_to_send, headers=h)
+                return await client.send(req, stream=True)
+            else:
+                return await client.post(url, json=body_to_send, headers=h)
+
+        # Acquire semaphore only if hitting Tier 1
+        if "tier1" in tag:
+            async with TIER1_SEMAPHORE:
+                res = await _execute()
+                return res, tag, model
         else:
-            res = await client.post(url, json=body_to_send, headers=h)
+            res = await _execute()
             return res, tag, model
 
     res, active_tag, active_model = await try_dispatch(target_upstream, target_model, tier_tag)
