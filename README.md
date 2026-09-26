@@ -44,3 +44,17 @@ Service unit templates are in `systemd/`:
 * `systemd/laya.service`
 * `systemd/llm-keypool.service`
 * `systemd/laya-router.service`
+
+## License
+MIT — see [LICENSE](LICENSE).
+
+## Contributing / Upstream
+This router is **standalone Python** by Jameson Bradfield. It consumes the
+[Laya](https://github.com/jamestb/laya) decision model over HTTP
+(`/v1/systemone`); it does not vendor or reimplement the model. Laya itself is
+a separate project with its own license and terms.
+
+If you want to contribute router work upstream, PRs are welcome here. If you
+want to contribute Laya *model* integration to the Hermes plugin ecosystem, the
+relevant upstream is `pavlealeksic/laya-hermes` (Apache-2.0) — this repository
+is not the place for that.

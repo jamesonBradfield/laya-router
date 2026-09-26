@@ -3,14 +3,59 @@ server:
   port: 8090
 
 upstreams:
-  laya: http://100.92.124.37:8081
+  laya: http://127.0.0.1:8081
   llama_swap: http://127.0.0.1:8080
   keypool: http://127.0.0.1:8005
 
 defaults:
-  tier1_v320_model: Tiel-Coder-35B-A3B-MTP-IQ3_XXS
-  tier2_7700xt_model: Ternary-Bonsai-2-27B-7700XT
-  large_context_chars: 180000  # ~45k tokens (local models have 65k context)
+  # 2026-09-26 07:2x — tier1 repointed from Qwen3.8-35B-A3B-APEX-MiniPlus (98304/3 = 32,768/slot)
+  # to Qwen3.6-35B-A3B-IQ2_XXS (65536/1 = 65,536/slot). Reason is a HARD crash, not a preference:
+  # Hermes gates agent init on MINIMUM_CONTEXT_LENGTH = 64,000 and probes the live server
+  # rather than reading model.context_length, so a 32,768/slot served window makes every
+  # profile raise "below the minimum 64,000" in 3-5 s with zero tokens emitted. All six
+  # profiles failed identically; the kanban board could not start a single worker.
+  # Both tiers had to change, not just this one: router.py sends every prompt whose
+  # est_tokens <= large_context_chars/4 to TIER2, so fixing tier1 alone still crashes on
+  # ordinary short prompts.
+  # Qwen3.6-35B-A3B-IQ2_XXS is the same 35B-A3B MoE class on the same V320/Vulkan1 card, at
+  # 65,536/slot, and is already declared context_length 65536 in every Hermes profile — so
+  # this needs no profile edit. It has no separate MTP draft file (--spec-type draft-mtp is
+  # declared but the entry supplies no --model-draft), so it is slower than MiniPlus; MiniPlus
+  # is deliberately KEPT in llama-swap because Honcho and LightRAG speak the raw OpenAI API,
+  # never run agent_init, and so are exempt from the floor while still using its 3 aux slots.
+  tier1_v320_model: Qwen3.6-35B-A3B-IQ2_XXS   # V320 lane, 65536/slot (1 slot)
+  tier2_7700xt_model: Swift-Bonsai-2-7700XT   # 7700XT lane, now 65536/slot (1 slot; was 2x32k)
+  # Above this prompt size, 'auto' routes to tier1 instead of tier2. 112,000 chars is
+  # 28,000 tokens at the //4 ratio router.py uses for est_tokens -- i.e. the
+  # reserve_floor_tokens below, so a prompt that no longer fits the 7700XT slot once the
+  # prompt floor is added gets the 65k V320 lane rather than a 400.
+  # Measured: worst-case floor 24,785 + 28,000 = 52,785 < 65,536, so tier1 always fits.
+  large_context_chars: 112000
+  # Budget inputs. The pruner only sees `messages`, so its cap must leave room for the
+  # static floor (system prompt + tool schemas + skills + memory) inside the lane. Hardcoding a
+  # round number here is how the 2026-09-25 overflow happened: 80000 chars of messages + a ~74k-char
+  # floor exceeded a 32k-token lane. Derived as (lane_ctx_tokens - reserve_floor_tokens) * 3
+  # in router.py::_prune_max_chars, and re-derived from the MEASURED floor by
+  # dfl/audit-declarations.py CI-4, so a stale value here is caught rather than trusted.
+  #
+  # 2026-09-26: reserve_floor_tokens was 20000, giving a 38,304-char budget against a
+  # MEASURED worst-case floor of 24,785 tokens (coder) -- 14,355 chars too generous, which is
+  # the same class of bug as the original 80000. Raised to 28000: budget 14,304 chars, inside
+  # the 23,949 available. router.py floors the result at 8192, so a future floor bump degrades
+  # to a smaller message budget rather than an overflow.
+  # 2026-09-26 07:3x — both lanes above now serve 65,536 tokens per slot (Swift went
+  # --parallel 2 -> 1 with aggregate ctx unchanged; tier1 is a 65536/1 entry). This must
+  # track them or the pruner keeps budgeting messages for a 32k lane: at 32768 it allowed
+  # (32768 - 28000) * 3 = 14,304 chars, which is needlessly tight now, and it was ALSO the
+  # number the 2026-09-25 overflow class of bug is measured against. Recomputed against the
+  # measured worst-case floor of 24,785 tokens (coder): 65,536 - 24,785 leaves 40,751 tokens
+  # of message room, so 28,000 reserve now UNDER-reserves rather than over-reserves.
+  # Raised to 30,000 to keep a real margin: budget becomes (65,536 - 30,000) * 3 = 106,608
+  # chars, still ~24,966 tokens of conversation above the measured floor.
+  # If you raise a lane's per-slot context again, this pair must be re-derived in the same
+  # commit -- CI-4 re-derives it from the MEASURED floor and will flag a stale value.
+  lane_ctx_tokens: 65536
+  reserve_floor_tokens: 30000
 
 thresholds:
   complex_coding_noul: 0.50
